@@ -16,6 +16,7 @@ Usage:
 import os, sys, csv, argparse
 import numpy as np
 import pandas as pd
+from scipy.ndimage import gaussian_filter1d
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -31,6 +32,7 @@ PLOT_DIR   = 'plots'
 
 AOAS    = [0, 5, 7.5, 10, 12.5, 15]
 MODELS  = ['ke', 'komega', 'rst']
+
 VARIABLES = {
     'cp': {
         # Case-insensitive substrings to match column headers.
@@ -46,16 +48,21 @@ VARIABLES = {
     },
 }
 
-N_BINS = 50   # chordwise bins for camber-line estimation
+# Number of chordwise bins for camber-line estimation.
+# Higher = finer resolution; the Gaussian smooth below handles noise.
+N_BINS = 200
 
-# ── Colours for each turbulence model ──────────
+# Gaussian smoothing sigma (in bin units) applied to the camber line estimate.
+# Increase if upper/lower are still misclassified near LE/TE.
+CAMBER_SMOOTH_SIGMA = 5
+
+# ── Colours ────────────────────────────────────
 MODEL_COLOURS = {
     'ke':     '#E63946',
     'komega': '#457B9D',
     'rst':    '#2D6A4F',
 }
 
-# ── Human-readable labels ──────────────────────
 MODEL_LABELS = {
     'ke':     r'$k$-$\varepsilon$',
     'komega': r'$k$-$\omega$',
@@ -63,8 +70,9 @@ MODEL_LABELS = {
 }
 
 AOA_COLOURS = {
-    0:    '#1b4332',
-    5:    '#40916c',
+    0:    '#03045e',
+    5:    '#0077b6',
+    7.5:  '#00b4d8',
     10:   '#f4a261',
     12.5: '#e76f51',
     15:   '#9b2226',
@@ -72,109 +80,101 @@ AOA_COLOURS = {
 
 
 # ─────────────────────────────────────────────
-# STAGE 2 — PLOT CONFIGURATION
+# STAGE 2 — PLOT CONFIGURATION (built programmatically)
 # ─────────────────────────────────────────────
-# Each entry in PLOT_CONFIGS defines one output PNG.
 #
-# Keys:
-#   output    – filename (saved into PLOT_DIR)
-#   variable  – 'cp' or 'wss'
-#   title     – plot title string
-#   ylabel    – y-axis label
-#   invert_y  – True for Cp (conventional aerofoil presentation)
-#   yrange    – (min, max) or None for auto
-#   series    – list of dicts, each with:
-#                   model   – 'ke', 'komega', 'rst'
-#                   aoa     – numeric AoA value
-#                   label   – legend label (upper surface entry)
-#                   colour  – hex colour (optional; falls back to
-#                             MODEL_COLOURS then AOA_COLOURS)
-#
-# Upper surface is always solid; lower always dashed.
-# Missing data is silently skipped.
+# Each entry defines one PNG.  Keys:
+#   output     – filename saved into PLOT_DIR
+#   variable   – 'cp' or 'wss'
+#   title      – plot title
+#   ylabel     – y-axis label
+#   invert_y   – True for Cp
+#   yrange     – (lo, hi) or None for auto  [None boundary = auto on that side]
+#   upper_only – if True, only the suction surface is plotted (no dashed lower)
+#   series     – list of dicts:
+#                    model   – 'ke', 'komega', 'rst'
+#                    aoa     – numeric AoA
+#                    label   – legend label
+#                    colour  – optional hex; falls back to MODEL_COLOURS / AOA_COLOURS
 
-PLOT_CONFIGS = {
+def _build_plot_configs():
+    cfgs = {}
 
-    # ── Cp: all models at AoA = 0 ──────────────
-    'cp_all_models_aoa0': {
-        'output':   'cp_all_models_aoa0.png',
-        'variable': 'cp',
-        'title':    r'$C_p$ — all turbulence models, $\alpha = 0°$',
-        'ylabel':   r'$C_p$',
-        'invert_y': True,
-        'yrange':   (-1.6, 1.2),
-        'series': [
-            {'model': 'ke',     'aoa': 0, 'label': r'$k$-$\varepsilon$'},
-            {'model': 'komega', 'aoa': 0, 'label': r'$k$-$\omega$'},
-            {'model': 'rst',    'aoa': 0, 'label': 'RST'},
-        ],
-    },
+    # ── Per-AOA: all three models ───────────────────────────────────────────
+    # Both surfaces shown; colour distinguishes turbulence model.
+    for aoa in AOAS:
+        aoa_label = f'{aoa:g}'
 
-    # ── Cp: all models at AoA = 15 ─────────────
-    'cp_all_models_aoa15': {
-        'output':   'cp_all_models_aoa15.png',
-        'variable': 'cp',
-        'title':    r'$C_p$ — all turbulence models, $\alpha = 15°$',
-        'ylabel':   r'$C_p$',
-        'invert_y': True,
-        'yrange':   (-2.5, 1.2),
-        'series': [
-            {'model': 'ke',     'aoa': 15, 'label': r'$k$-$\varepsilon$'},
-            {'model': 'komega', 'aoa': 15, 'label': r'$k$-$\omega$'},
-            {'model': 'rst',    'aoa': 15, 'label': 'RST'},
-        ],
-    },
+        cfgs[f'cp_all_models_aoa{aoa_label}'] = {
+            'output':     f'cp_all_models_aoa{aoa_label}.png',
+            'variable':   'cp',
+            'title':      rf'$C_p$ — all turbulence models, $\alpha = {aoa_label}°$',
+            'ylabel':     r'$C_p$',
+            'invert_y':   True,
+            'yrange':     None,
+            'upper_only': False,
+            'series': [
+                {'model': 'ke',     'aoa': aoa, 'label': MODEL_LABELS['ke']},
+                {'model': 'komega', 'aoa': aoa, 'label': MODEL_LABELS['komega']},
+                {'model': 'rst',    'aoa': aoa, 'label': MODEL_LABELS['rst']},
+            ],
+        }
 
-    # ── Cp: RST across all AoAs ─────────────────
-    'cp_rst_all_aoa': {
-        'output':   'cp_rst_all_aoa.png',
-        'variable': 'cp',
-        'title':    r'$C_p$ — RST model, all $\alpha$',
-        'ylabel':   r'$C_p$',
-        'invert_y': True,
-        'yrange':   None,
-        'series': [
-            {'model': 'rst', 'aoa': 0,    'label': r'$\alpha = 0°$',    'colour': AOA_COLOURS[0]},
-            {'model': 'rst', 'aoa': 5,    'label': r'$\alpha = 5°$',    'colour': AOA_COLOURS[5]},
-            {'model': 'rst', 'aoa': 10,   'label': r'$\alpha = 10°$',   'colour': AOA_COLOURS[10]},
-            {'model': 'rst', 'aoa': 12.5, 'label': r'$\alpha = 12.5°$', 'colour': AOA_COLOURS[12.5]},
-            {'model': 'rst', 'aoa': 15,   'label': r'$\alpha = 15°$',   'colour': AOA_COLOURS[15]},
-        ],
-    },
+        cfgs[f'wss_all_models_aoa{aoa_label}'] = {
+            'output':     f'wss_all_models_aoa{aoa_label}.png',
+            'variable':   'wss',
+            'title':      rf'WSS — all turbulence models, $\alpha = {aoa_label}°$',
+            'ylabel':     'Wall Shear Stress (Pa)',
+            'invert_y':   False,
+            'yrange':     (0, None),
+            'upper_only': False,
+            'series': [
+                {'model': 'ke',     'aoa': aoa, 'label': MODEL_LABELS['ke']},
+                {'model': 'komega', 'aoa': aoa, 'label': MODEL_LABELS['komega']},
+                {'model': 'rst',    'aoa': aoa, 'label': MODEL_LABELS['rst']},
+            ],
+        }
 
-    # ── WSS: all models at AoA = 0 ─────────────
-    'wss_all_models_aoa0': {
-        'output':   'wss_all_models_aoa0.png',
-        'variable': 'wss',
-        'title':    r'WSS — all turbulence models, $\alpha = 0°$',
-        'ylabel':   'Wall Shear Stress (Pa)',
-        'invert_y': False,
-        'yrange':   (0, None),
-        'series': [
-            {'model': 'ke',     'aoa': 0, 'label': r'$k$-$\varepsilon$'},
-            {'model': 'komega', 'aoa': 0, 'label': r'$k$-$\omega$'},
-            {'model': 'rst',    'aoa': 0, 'label': 'RST'},
-        ],
-    },
+    # ── Per-model: all AOAs ─────────────────────────────────────────────────
+    # Suction surface only (upper_only=True); colour distinguishes AoA.
+    for model in MODELS:
+        model_label = MODEL_LABELS[model]
 
-    # ── WSS: RST across all AoAs ────────────────
-    'wss_rst_all_aoa': {
-        'output':   'wss_rst_all_aoa.png',
-        'variable': 'wss',
-        'title':    r'WSS — RST model, all $\alpha$',
-        'ylabel':   'Wall Shear Stress (Pa)',
-        'invert_y': False,
-        'yrange':   (0, None),
-        'series': [
-            {'model': 'rst', 'aoa': 0,    'label': r'$\alpha = 0°$',    'colour': AOA_COLOURS[0]},
-            {'model': 'rst', 'aoa': 5,    'label': r'$\alpha = 5°$',    'colour': AOA_COLOURS[5]},
-            {'model': 'rst', 'aoa': 7.5,  'label': r'$\alpha = 7.5°$',  'colour': AOA_COLOURS[7.5]},
-            {'model': 'rst', 'aoa': 10,   'label': r'$\alpha = 10°$',   'colour': AOA_COLOURS[10]},
-            {'model': 'rst', 'aoa': 12.5, 'label': r'$\alpha = 12.5°$', 'colour': AOA_COLOURS[12.5]},
-            {'model': 'rst', 'aoa': 15,   'label': r'$\alpha = 15°$',   'colour': AOA_COLOURS[15]},
-        ],
-    },
-}
+        cfgs[f'cp_{model}_all_aoa'] = {
+            'output':     f'cp_{model}_all_aoa.png',
+            'variable':   'cp',
+            'title':      rf'$C_p$ — {model_label}, all $\alpha$',
+            'ylabel':     r'$C_p$',
+            'invert_y':   True,
+            'yrange':     None,
+            'upper_only': True,
+            'series': [
+                {'model': model, 'aoa': aoa,
+                 'label': rf'$\alpha = {aoa:g}°$',
+                 'colour': AOA_COLOURS[aoa]}
+                for aoa in AOAS
+            ],
+        }
+
+        cfgs[f'wss_{model}_all_aoa'] = {
+            'output':     f'wss_{model}_all_aoa.png',
+            'variable':   'wss',
+            'title':      rf'WSS — {model_label}, all $\alpha$',
+            'ylabel':     'Wall Shear Stress (Pa)',
+            'invert_y':   False,
+            'yrange':     (0, None),
+            'upper_only': True,
+            'series': [
+                {'model': model, 'aoa': aoa,
+                 'label': rf'$\alpha = {aoa:g}°$',
+                 'colour': AOA_COLOURS[aoa]}
+                for aoa in AOAS
+            ],
+        }
+
+    return cfgs
+
+PLOT_CONFIGS = _build_plot_configs()
 
 
 # ─────────────────────────────────────────────
@@ -182,22 +182,22 @@ PLOT_CONFIGS = {
 # ─────────────────────────────────────────────
 
 def aoa_str(aoa):
-    """Format AoA as string suitable for filenames: 12.5 → '12.5', 0 → '0'."""
+    """Format AoA for filenames: 12.5 → '12.5', 0 → '0'."""
     return str(aoa).rstrip('0').rstrip('.') if '.' in str(aoa) else str(aoa)
 
 
 def raw_filename(variable, model, aoa):
-    template = f'aoa{aoa_str(aoa)}_{model}_{variable}_vs_zoverc.csv'
-    return os.path.join(RAW_DIR, template)
+    return os.path.join(RAW_DIR,
+                        f'aoa{aoa_str(aoa)}_{model}_{variable}_vs_zoverc.csv')
 
 
 def sorted_filename(surface, model, variable, aoa):
-    fname = f'{surface}_{model}_{variable}_aoa{aoa_str(aoa)}.csv'
-    return os.path.join(SORTED_DIR, fname)
+    return os.path.join(SORTED_DIR,
+                        f'{surface}_{model}_{variable}_aoa{aoa_str(aoa)}.csv')
 
 
 def find_col(headers_lower, keywords):
-    """Return index of first header containing any keyword, or None."""
+    """Return index of first header containing any keyword (case-insensitive)."""
     for i, h in enumerate(headers_lower):
         for kw in keywords:
             if kw in h:
@@ -212,9 +212,10 @@ def read_raw_csv(filepath, z_keywords, val_keywords, y_keywords):
         raw_header = next(reader)
         headers_lower = [h.strip().lower() for h in raw_header]
 
-        col_z   = find_col(headers_lower, z_keywords)
-        col_y   = find_col(headers_lower, y_keywords)
-        # For val, skip any column already claimed by z or y
+        col_z = find_col(headers_lower, z_keywords)
+        col_y = find_col(headers_lower, y_keywords)
+
+        # Value column: first match not already claimed by z or y
         col_val = None
         for i, h in enumerate(headers_lower):
             if i in (col_z, col_y):
@@ -244,7 +245,16 @@ def read_raw_csv(filepath, z_keywords, val_keywords, y_keywords):
     return rows
 
 
-def split_and_normalise(rows, n_bins=N_BINS):
+def split_and_normalise(rows, n_bins=N_BINS, smooth_sigma=CAMBER_SMOOTH_SIGMA):
+    """
+    Split points into upper/lower surface using a smoothed local camber line.
+
+    The camber line is estimated as the mean Y in each chordwise bin, then
+    smoothed with a Gaussian filter.  This is robust to:
+      - Cambered aerofoils at non-zero AoA
+      - Sparse bins near LE/TE
+      - Noisy surface meshes (e.g. aoa5 intermediate AoAs)
+    """
     zs   = np.array([r[0] for r in rows])
     ys   = np.array([r[1] for r in rows])
     vals = np.array([r[2] for r in rows])
@@ -252,24 +262,42 @@ def split_and_normalise(rows, n_bins=N_BINS):
     z_min, z_max = zs.min(), zs.max()
     z_norm = (zs - z_min) / (z_max - z_min)
 
+    # Per-bin mean Y
     bins = np.linspace(0, 1, n_bins + 1)
-    local_mean_y = np.zeros(len(rows))
-
+    bin_mean_y = np.full(n_bins, np.nan)
     for i in range(n_bins):
-        mask = (z_norm >= bins[i]) & (z_norm < bins[i + 1])
-        local_mean_y[mask] = ys[mask].mean() if mask.sum() > 0 else ys.mean()
+        lo, hi = bins[i], bins[i + 1]
+        mask = (z_norm >= lo) & (z_norm < hi)
+        if i == n_bins - 1:
+            mask |= (z_norm == 1.0)
+        if mask.sum() > 0:
+            bin_mean_y[i] = ys[mask].mean()
 
-    mask_last = z_norm == 1.0
-    if mask_last.sum() > 0:
-        local_mean_y[mask_last] = ys[mask_last].mean()
+    # Fill empty bins by linear interpolation
+    nan_mask = np.isnan(bin_mean_y)
+    if nan_mask.any() and (~nan_mask).sum() >= 2:
+        x_idx = np.arange(n_bins)
+        bin_mean_y[nan_mask] = np.interp(
+            x_idx[nan_mask], x_idx[~nan_mask], bin_mean_y[~nan_mask]
+        )
+    elif nan_mask.all():
+        bin_mean_y[:] = ys.mean()
 
-    upper_mask = ys >= local_mean_y
-    lower_mask = ~upper_mask
+    # Smooth the camber line estimate
+    smoothed = gaussian_filter1d(bin_mean_y, sigma=smooth_sigma, mode='nearest')
+
+    # Map each point to its bin's smoothed camber Y
+    bin_indices = np.clip(
+        np.searchsorted(bins[1:], z_norm, side='right'), 0, n_bins - 1
+    )
+    local_camber_y = smoothed[bin_indices]
+
+    upper_mask = ys >= local_camber_y
 
     def extract(mask):
         return sorted(zip(z_norm[mask], vals[mask]), key=lambda r: r[0])
 
-    return extract(upper_mask), extract(lower_mask)
+    return extract(upper_mask), extract(~upper_mask)
 
 
 def write_sorted_csv(pts, filepath, value_name):
@@ -286,7 +314,7 @@ def write_sorted_csv(pts, filepath, value_name):
 
 def build_dataframe():
     """
-    Scan all (aoa × model × variable) combinations.
+    Scan all (aoa x model x variable) combinations.
     For each found file: sort upper/lower, write sorted CSVs,
     append rows to master list.
     Returns a DataFrame with columns:
@@ -316,19 +344,13 @@ def build_dataframe():
 
                 upper, lower = split_and_normalise(rows)
 
-                # Write sorted CSVs
-                write_sorted_csv(
-                    upper,
-                    sorted_filename('upper', model, variable, aoa),
-                    variable.upper(),
-                )
-                write_sorted_csv(
-                    lower,
-                    sorted_filename('lower', model, variable, aoa),
-                    variable.upper(),
-                )
+                write_sorted_csv(upper,
+                                 sorted_filename('upper', model, variable, aoa),
+                                 variable.upper())
+                write_sorted_csv(lower,
+                                 sorted_filename('lower', model, variable, aoa),
+                                 variable.upper())
 
-                # Append to master records
                 for z, val in upper:
                     records.append((aoa, model, variable, 'upper', z, val))
                 for z, val in lower:
@@ -366,6 +388,8 @@ def render_plots(df):
         fig, ax = plt.subplots(figsize=(10, 6))
         legend_handles = []
         any_data = False
+        upper_only = cfg.get('upper_only', False)
+        surfaces   = ('upper',) if upper_only else ('upper', 'lower')
 
         for series in cfg['series']:
             model    = series['model']
@@ -374,10 +398,10 @@ def render_plots(df):
             colour   = resolve_colour(series)
             variable = cfg['variable']
 
-            for surface in ('upper', 'lower'):
+            for surface in surfaces:
                 subset = df[
-                    (df['aoa']      == aoa)    &
-                    (df['model']    == model)  &
+                    (df['aoa']      == aoa)      &
+                    (df['model']    == model)    &
                     (df['variable'] == variable) &
                     (df['surface']  == surface)
                 ].sort_values('z_over_c')
@@ -395,7 +419,6 @@ def render_plots(df):
                 )
                 any_data = True
 
-            # One legend entry per series (solid line; label describes the series)
             legend_handles.append(
                 mlines.Line2D([], [], color=colour, linestyle='-',
                               linewidth=2.0, label=label)
@@ -406,15 +429,16 @@ def render_plots(df):
             plt.close(fig)
             continue
 
-        # Surface style legend entries (shared across all series)
-        legend_handles.append(
-            mlines.Line2D([], [], color='grey', linestyle='-',
-                          linewidth=1.5, label='Suction surface')
-        )
-        legend_handles.append(
-            mlines.Line2D([], [], color='grey', linestyle='--',
-                          linewidth=1.5, label='Pressure surface')
-        )
+        # Surface convention legend (only when both surfaces are shown)
+        if not upper_only:
+            legend_handles.append(
+                mlines.Line2D([], [], color='grey', linestyle='-',
+                              linewidth=1.5, label='Suction surface')
+            )
+            legend_handles.append(
+                mlines.Line2D([], [], color='grey', linestyle='--',
+                              linewidth=1.5, label='Pressure surface')
+            )
 
         ax.set_xlabel('x/c', fontsize=13)
         ax.set_ylabel(cfg['ylabel'], fontsize=13)
@@ -462,8 +486,8 @@ def main():
 
     if args.stage in (None, 2):
         print('\n── Stage 2: rendering plots ─────────────────────────────')
+        print(f'  {len(PLOT_CONFIGS)} plots configured.')
         if df is None:
-            # Re-build from sorted CSVs if running stage 2 standalone
             print('  (stage 1 not run — reading sorted_data/ to rebuild DataFrame)')
             df = rebuild_from_sorted()
         render_plots(df)
@@ -481,7 +505,7 @@ def rebuild_from_sorted():
     for fname in os.listdir(SORTED_DIR):
         if not fname.endswith('.csv'):
             continue
-        # Filename pattern: {surface}_{model}_{variable}_aoa{aoa}.csv
+        # Pattern: {surface}_{model}_{variable}_aoa{aoa}.csv
         parts = fname.replace('.csv', '').split('_')
         if len(parts) < 4:
             continue
@@ -497,7 +521,7 @@ def rebuild_from_sorted():
         fpath = os.path.join(SORTED_DIR, fname)
         with open(fpath, newline='') as f:
             reader = csv.reader(f)
-            next(reader)  # skip header
+            next(reader)
             for row in reader:
                 try:
                     records.append((aoa, model, variable, surface,
